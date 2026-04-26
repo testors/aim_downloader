@@ -37,7 +37,7 @@ Important constraints discovered on real hardware:
 | Checksum = `sum(payload) & 0xffff` | Common |
 | About `0.4s` settle after TCP connect and before hello | Important on real hardware |
 | 8-byte hello (`06 08` / `06 09`) exchange | Common and required |
-| 64-byte `cmd=0x10/0x01` plus 68-byte time sync bootstrap | Required on all observed devices |
+| 64-byte `cmd=0x10/0x01` plus 68-byte time sync bootstrap | Required for list / download / device-info; not needed for delete-only sessions (see §10) |
 | Request `status=0x00000001` marker | Required on some firmware; safest to always send |
 | Continuous UDP `aim-ka` while TCP is active | Common to stable implementations and vendor app |
 | List prep `0x51/0x02` twice, then `dev.ria` probe | Common, with two cache/fresh paths |
@@ -318,6 +318,11 @@ Deadlock rule:
 
 If the client waits for `0xa11` first, both sides can block forever.
 
+The 2026-04-24 delete capture showed that this bootstrap is only
+required for `0x10/0x01`-class flows (device info, list, download).
+A vendor-app session that issued only delete commands went straight
+from hello to `0x06/0x04` and worked. See §10.
+
 ### 6.3 The 68-byte time sync payload
 
 ```text
@@ -356,6 +361,7 @@ Notation is `cmd / sub`, both in hex.
 | --- | --- | --- | --- | --- | --- |
 | `0x10` | `0x01` | `0x00010010` | full device info | `0x01` + zero padding | 3225B nested block stream |
 | `0x06` | `0x01` | `0x00010006` | light state ping | none | `size=0` |
+| `0x06` | `0x04` | `0x00040006` | file delete | path up to 32B | `size=0`; arg echoes path |
 | `0x02` | `0x04` | `0x00040002` | file read | path up to 32B | `size` + chunked stream |
 | `0x24` | `0x02` | `0x00020024` | session list | none | 13490B CSV |
 | `0x24` | `0x06` | `0x00060024` | system info page | none | 320B binary |
@@ -526,7 +532,86 @@ unverified.
 - they begin with zlib bytes such as `78 01`
 - the CLI can safely save the received bytes as-is
 
-## 10. Device-Info Block From `0x10/0x01`
+## 10. File Delete Protocol
+
+### 10.1 Sequence
+
+```text
+C -> S : STNC 0x06/0x04 path="1:/mem/a_6994.xrz"
+S -> C : STCP status=0xa09  arg="1:/mem/a_6994.xrz"
+S -> C : STCP status=0xa11  size=0  arg="1:/mem/a_6994.xrz"
+```
+
+The `0xa11` reply with `size=0` signals completion. No body stream
+follows. The client must not send an offset ACK afterwards.
+
+### 10.2 Distinguishing features
+
+Two things make delete responses different from every other observed
+command:
+
+- both `0xa09` and `0xa11` echo the requested path back in the
+  arg field of the 64-byte command header. List, download, and
+  device-info responses leave that field empty. Path echo is a
+  useful matching signal when several deletes are in flight on the
+  same connection.
+- there is no body stream. `size=0` plus the `0xa11` status is the
+  whole result.
+
+### 10.3 Multiple-file deletion
+
+There is no batch or wildcard delete command. Each `0x06/0x04`
+request carries exactly one path in its 32-byte arg field.
+
+To delete N files, the vendor app issues N sequential requests on
+one TCP connection, waiting for each `0xa11` before sending the
+next. Pipelining (sending the next request before `0xa11` arrives)
+was not observed and is unverified.
+
+### 10.4 Session-level requirements
+
+The vendor app delete capture started a fresh TCP connection and
+went straight from hello to delete:
+
+```text
+TCP SYN/ACK
+~0.4s settle
+C -> S : STCP 8B hello   06 08
+S -> C : STCP 8B hello   06 09
+C -> S : delete a_6994.xrz   ->  0xa09 / 0xa11
+C -> S : delete a_6993.xrz   ->  0xa09 / 0xa11
+C -> S : 0x24/0x02 list      ->  CSV without those rows
+TCP FIN
+```
+
+Compared to the list and download flows, two steps are notably
+absent:
+
+- no `0x10/0x01` bootstrap, no 68-byte time sync. Hello alone is
+  enough for delete on this firmware.
+- no `0x51/0x02` list-prep before the post-delete `0x24/0x02`.
+  Delete appears to invalidate the device-side `dev.ria` cache
+  internally, so a plain list call returns the updated CSV.
+
+### 10.5 Verification
+
+The CSV returned by `0x24/0x02` shrinks by the deleted rows. In one
+captured session, deleting a single file reduced the list CSV from
+12620 to 12501 bytes, matching the row width of a single entry.
+Clients can call `0x24/0x02` after a delete batch to confirm the
+targeted files are gone.
+
+### 10.6 Unverified edge cases
+
+- behaviour when the path does not exist; likely `0xa1d` empty by
+  analogy with other commands, but not captured
+- delete on a locked memory partition (`lck_mem=1`)
+- delete during an active recording session
+- whether the device queues pipelined requests or rejects them
+- whether other AiM models accept `0x06/0x04` with the same arg
+  format
+
+## 11. Device-Info Block From `0x10/0x01`
 
 After stripping the outer 4-byte offset prefix, the device-info body contains a
 sequence of nested inner blocks:
@@ -542,7 +627,7 @@ sequence of nested inner blocks:
 | `iLTS` | 81 | ASCII `k=v|` | last test time |
 | `iPRL` | 1312 | CSV | parameter/options list |
 
-### 10.1 `iPTH`: key block
+### 11.1 `iPTH`: key block
 
 `iPTH` is a CRLF-separated list of:
 
@@ -567,7 +652,7 @@ tkk=0:/tkk,0:/tkk.N|
 
 Conclusion: recorded session files live under `1:/mem/<name>`.
 
-### 10.2 `iHW `
+### 11.2 `iHW `
 
 Observed example:
 
@@ -575,7 +660,7 @@ Observed example:
 WiFi=WF121|Reg=eu|Rev=01|
 ```
 
-### 10.3 `iPRL`
+### 11.3 `iPRL`
 
 `iPRL` exposes Wi-Fi parameters such as:
 
@@ -604,7 +689,7 @@ WiFi,wf_dhcp,DHCP Server,b,1,1,
 `wf_ip` in the capture listed `10/11/12.0.0.1`, while real-device testing also
 confirmed `14.0.0.1` as a valid AP address.
 
-### 10.4 `iMST`
+### 11.4 `iMST`
 
 Partial interpretation of the first bytes:
 
@@ -620,7 +705,7 @@ Partial interpretation of the first bytes:
 The byte sequence matches the tail of some discovery replies, but full field
 decoding still needs more cross-device captures.
 
-### 10.5 `iLCK`
+### 11.5 `iLCK`
 
 Observed block:
 
@@ -633,7 +718,7 @@ lck_trk=0|
 
 All observed values were unlocked (`0`).
 
-### 10.6 `iSST`
+### 11.6 `iSST`
 
 Observed values include:
 
@@ -658,7 +743,7 @@ sys_predreflap=1|
 
 These appear to be system feature flags and interface clock/baud settings.
 
-### 10.7 `iLTS`
+### 11.7 `iLTS`
 
 Observed block:
 
@@ -675,7 +760,7 @@ lt_sz=0|
 
 This looks like "last test" metadata.
 
-### 10.8 `iUSR` / `USR `
+### 11.8 `iUSR` / `USR `
 
 `iUSR` is a normal inner frame, but the nested `USR ` block uses the ASCII
 length/checksum variant:
@@ -696,9 +781,9 @@ length/checksum variant:
 
 Observed values were all empty.
 
-## 11. CLI Implementation Guide
+## 12. CLI Implementation Guide
 
-### 11.1 Minimal flow
+### 12.1 Minimal flow
 
 Per TCP session:
 
@@ -728,14 +813,14 @@ Per TCP session:
 
 Always send `status=0x00000001` in every 64-byte client request.
 
-### 11.2 State-machine tips
+### 12.2 State-machine tips
 
 - `0xa01`: intermediate ack
 - `0xa09`: pending; continue waiting
 - `0xa11`: ready; `size` becomes valid
 - `0xa1d`: empty / no result; switch to the alternate path rather than retrying
 
-### 11.3 Frame parser pseudocode
+### 12.3 Frame parser pseudocode
 
 ```python
 def recv_frame(sock_buf: bytearray, sock) -> tuple[bytes, bytes]:
@@ -772,7 +857,7 @@ Key parser rules:
 - detect EOF when `recv()` returns `b""`
 - in production code, prefer explicit error handling over `assert`
 
-### 11.4 Frame builder
+### 12.4 Frame builder
 
 ```python
 def wrap_frame(tag: bytes, payload: bytes) -> bytes:
@@ -782,7 +867,7 @@ def wrap_frame(tag: bytes, payload: bytes) -> bytes:
     return hdr + payload + b"<" + tag + chk + b">"
 ```
 
-### 11.5 64-byte command builder
+### 12.5 64-byte command builder
 
 ```python
 import struct
@@ -807,9 +892,9 @@ def make_cmd64(cmd: int, sub: int, *, path: str = "", arg_tail: bytes = b"",
 init_frame = make_cmd64(0x10, 0x01, arg_tail=b"\x01", size=0x40)
 ```
 
-## 12. Validation Status
+## 13. Validation Status
 
-### 12.1 Confirmed on real devices
+### 13.1 Confirmed on real devices
 
 - UDP discovery payload layout is firmware-dependent; only source port `36002`
   is a safe filter
@@ -818,14 +903,21 @@ init_frame = make_cmd64(0x10, 0x01, arg_tail=b"\x01", size=0x40)
 - stable sessions matched the vendor app only when UDP `aim-ka` continued while
   TCP was active
 - request `status=0x1` is required for some firmware
-- bootstrap init plus time sync is effectively mandatory
+- bootstrap init plus time sync is mandatory for `0x10/0x01`-class flows
+  (device info, list, download)
+- bootstrap is NOT required for delete-only sessions; vendor app went
+  hello -> `0x06/0x04` directly (verified 2026-04-24, see §10)
 - time sync must be sent immediately after the first `0xa01`
 - 4-byte `STCP payload=0` delimiters may appear between status frames
 - `0x10/0x01 size=0x40` matched the capture, but some units also accepted `0`
 - the two-step list path (`dev.ria` empty -> `0x24/0x02`) was reproduced on
   at least two firmware variants
+- `0x06/0x04` file delete reproduced on the vendor app: response is
+  `0xa09` then `0xa11 size=0`, both echoing the requested path in arg.
+  No body stream and no `0x51/0x02` prep needed before the post-delete
+  list (verified 2026-04-24)
 
-### 12.2 Still unverified
+### 13.2 Still unverified
 
 1. Full field decoding of the 128-byte `iMST` block
 2. Meaning of late words in the 64-byte init request/response pair
@@ -838,8 +930,14 @@ init_frame = make_cmd64(0x10, 0x01, arg_tail=b"\x01", size=0x40)
 9. Whether UDP keep-alive is independently mandatory, or simply correlated with
    the correct session pattern
 10. Whether all other models require time sync as part of bootstrap
+11. Whether `0x06/0x04` accepts pipelined requests (next request before the
+    previous `0xa11` arrives), or rejects them
+12. Status returned for `0x06/0x04` against a non-existent path (likely
+    `0xa1d` empty by analogy, but not captured)
+13. Whether `0x06/0x04` works against locked memory (`lck_mem=1`) or during
+    an active recording session
 
-## 13. Evidence References
+## 14. Evidence References
 
 | Observation | Capture reference |
 | --- | --- |
@@ -855,9 +953,14 @@ init_frame = make_cmd64(0x10, 0x01, arg_tail=b"\x01", size=0x40)
 | device-info body | frames 35 through 45 |
 | `0x24/0x02` session list | around frame 332 |
 | file download chunk stream | around frame 420 onward |
+| `0x06/0x04` delete request, path-echo `0xa09` reply | `delete.pcapng` frames 78, 79+81 (reassembled) |
+| `0x06/0x04` delete `0xa11 size=0` completion | `delete.pcapng` frames 83+85 (reassembled) |
+| post-delete `0x24/0x02` list with shrunken CSV | `delete.pcapng` frames 89 through 130 |
+| fresh TCP session: hello -> delete x2 -> list (no bootstrap) | `delete.pcapng` frames 183 through 254 |
 
 Frame numbers are approximate references for manual re-checking with:
 
 ```bash
 tshark -r download.pcapng -Y 'tcp.port==2000'
+tshark -r delete.pcapng   -Y 'tcp.port==2000'
 ```

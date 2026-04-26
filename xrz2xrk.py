@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import argparse
 import sys
-import zlib
 from pathlib import Path
+
+from aim_telemetry import read_raw_bytes
 
 
 FOOTER_FIELDS = (
@@ -47,42 +48,6 @@ def parse_args() -> argparse.Namespace:
         help="Overwrite the output file if it already exists",
     )
     return parser.parse_args()
-
-
-def looks_like_zlib(data: bytes) -> bool:
-    if len(data) < 2:
-        return False
-    cmf, flg = data[0], data[1]
-    if (cmf & 0x0F) != 0x08:
-        return False
-    return ((cmf << 8) | flg) % 31 == 0
-
-
-def normalize_input_format(path: Path, data: bytes, requested: str) -> str:
-    if requested != "auto":
-        return requested
-
-    suffix = path.suffix.lower()
-    if suffix == ".xrk":
-        raise ValueError("input already looks like .xrk; use .xrz/.raw or override --input-format")
-    if suffix == ".xrz":
-        return "xrz"
-    if suffix == ".raw":
-        return "raw"
-    if looks_like_zlib(data):
-        return "xrz"
-    return "raw"
-
-
-def read_raw_bytes(path: Path, input_format: str) -> tuple[bytes, str]:
-    data = path.read_bytes()
-    mode = normalize_input_format(path, data, input_format)
-    if mode == "raw":
-        return data, mode
-    try:
-        return zlib.decompress(data), mode
-    except zlib.error as exc:
-        raise ValueError(f"failed to zlib-decompress {path}: {exc}") from exc
 
 
 def encode_tag(tag: str) -> bytes:

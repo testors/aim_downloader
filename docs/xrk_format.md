@@ -200,6 +200,17 @@ format:
 | `Magnetom*` | 2 | 2 | 6 | `M` |
 | `InlineAcc` / `LateralAcc` / `VerticalAcc` | 2 | 6 | 6 | `M` |
 
+Practical CHS metadata worth preserving in code:
+
+- `unit_type_byte & 0x7f` -> display units and decimal precision
+- `unit_type_byte & 0x80` -> calibrated flag; calibrated `mV` channels are
+  rendered as `V`
+- `decoder_type` -> scalar decoder family plus interpolate vs step-hold
+- `source_type`, `hardware_id`, `hardware_ref`, `source_channel_id` -> enough
+  to map newer expansion-device `(c)` streams back to logical channels
+- `cal_value_1/2`, `display_range_min/max`, `device_tag` -> useful metadata
+  even when the current CSV exporter does not surface them directly
+
 ### 4.4 Full channel list
 
 | id | short | long name | width | period_us | codec(a,b) | Notes |
@@ -645,6 +656,25 @@ This looks like a fixed-width summary snapshot rather than a streamed sample.
 The second `CNF` inside the body is not a new section boundary. It should be
 consumed as an ordinary body tag frame that updates the schema.
 
+### 7.7 Expansion `(c)` messages
+
+Newer loggers emit `(c)` records alongside the older `S` / `M` / `G` stream.
+Three variants are now confirmed:
+
+- `V1`: legacy `(c)` record with embedded `timecode` and CHS-sized payload
+- `V2`: 16-byte record carrying two fp16 samples
+- `V3`: 10-byte record carrying one fp16 sample whose `timecode` is inherited
+  from the surrounding `V2` pair
+
+For `V2` / `V3`, the `channel_field` is not the final channel id. The mapping
+is resolved against CHS metadata:
+
+- paired `(base, base+4)` fields map to the high-rate expansion channels
+- orphan fields map to the mid-rate expansion channels in the same sorted CHS
+  order
+- `V2` contributes two fp16 samples and `V3` contributes the missing center
+  sample, giving the 2 ms shock-pot pattern seen on newer logs
+
 ## 8. Timebase
 
 - first session `MClk` tick: `1,102,643 ms`
@@ -655,10 +685,26 @@ Therefore:
 
 - the device's monotonic millisecond clock is the master session time axis
 - all `S/M/G` record ticks, `GPS.word0`, and `LAP.f4` share that same axis
-- CSV `Time=0.000` corresponds to the first `MClk` tick
+- session-relative `Time` should be anchored to:
+  `first_LAP.end_time - first_LAP.duration`
+- if no `LAP` message exists, the fallback origin is the minimum first timecode
+  observed across all channels
 
 Also, `GPS.word1 = 441,503,900` is Friday `02:38:23.9 UTC`, which becomes
 `11:38:23.9 KST` and matches the CSV session header time.
+
+Some logs also contain a GPS-specific tick bug:
+
+- `GPS.word0` occasionally jumps forward by about `65533 ms`
+- this is not a leap-second or UTC/GPS epoch issue
+- practical repair is to subtract the excess jump from subsequent GPS samples,
+  or rebuild the wrapped upper 16 bits when the stream stops being monotonic
+- `GNFI` span is a useful plausibility check because it stays on the logger's
+  internal clock and is not affected by the GPS bug
+
+If `LAP` is absent, `TRK` start/finish geometry plus GPS is sufficient to
+infer lap boundaries later, but the current CSV exporter only needs the
+session-start offset above.
 
 ## 9. CSV <-> Raw Mapping Summary
 
@@ -666,7 +712,7 @@ Only confirmed mappings are listed here.
 
 | CSV column | Source | Formula / interpretation |
 | --- | --- | --- |
-| Time | `MClk` `S` record | `(tick - first_MClk) / 1000` |
+| Time | `MClk` `S` record + `LAP` | `(tick - session_start_tick) / 1000`, where `session_start_tick = first_LAP.end_time - first_LAP.duration`; fallback: `min(first_channel_ticks)` |
 | Internal Battery | `ch12 S2` | `half_float(raw) / 1000` V |
 | External Voltage | `ch13 S2` | same |
 | Distance Lap | `ch14 S4` | `float32(raw)` m |
@@ -695,7 +741,7 @@ Only confirmed mappings are listed here.
 | GPS PosAccuracy | `GPS.word7` | `word7 * 10` mm |
 | GPS SpdAccuracy | `GPS.word11` | `word11 * 0.036` km/h |
 | GPS Nsat | `GPS.word12 >> 24` | count |
-| Beacon Markers | `LAP.f4` | `(f4 - first_MClk) / 1000` |
+| Beacon Markers | `LAP.f4` | `(f4 - session_start_tick) / 1000` |
 
 ## 10. Parser Skeleton for Implementation
 
@@ -775,9 +821,11 @@ def parse_file(raw: bytes):
 Core implementation rules:
 
 - recover `CHS` and `GRP` from `CNF1` first
-- then parse the body as a mixed stream of `S/M/G` records and tag frames
+- then parse the body as a mixed stream of `S/M/G/(c)` records and tag frames
 - allow the later `CNF2`
 - decode `G` payloads using the group definition plus channel widths
+- resolve `V2` / `V3` `(c)` channel ids from CHS metadata before emitting
+  expansion samples
 
 ## 11. Open Questions
 
@@ -794,8 +842,10 @@ Core implementation rules:
 ## 12. Practical Takeaways
 
 - after downloading `xrz`, zlib inflate gives the `raw` body
+- if the `xrz` stream is truncated, a `decompressobj().flush()` salvage path
+  often recovers a structurally valid partial session
 - `xrk` is `raw + 120B footer`, so an `xrz -> xrk` regenerator is practical
-- once `CNF` has been decoded, the body `S/M/G` records parse cleanly
+- once `CNF` has been decoded, the body `S/M/G/(c)` records parse cleanly
 - CAN and enum data in `G` records map almost directly to CSV
 - GPS position and velocity reconstruct well from ECEF + ECEF velocity
 - `M` records are structurally solved, but calibration remains unresolved

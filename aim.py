@@ -6,9 +6,11 @@ Subcommands:
   list      [--host IP]            Show recorded sessions (from dev.ria / 0x24-02).
   download  NAME... [-o DIR]       Download one or more sessions by name.
   download  --all   [-o DIR]       Download every session in the list.
+  delete    NAME...                Delete one or more sessions by name.
+  delete    --all                  Delete every session in the list.
   info      [--host IP]            Dump device info block (cmd 0x10/01).
 
-See final_aim_wifi_protocol.md for the protocol spec this implements.
+See docs/wifi_protocol.md for the protocol spec this implements.
 """
 
 from __future__ import annotations
@@ -62,6 +64,7 @@ CONNECT_SETTLE_DELAY = 0.4
 
 CMD_DEVINFO = (0x10, 0x01)
 CMD_SYNC_PING = (0x06, 0x01)
+CMD_FILE_DELETE = (0x06, 0x04)
 CMD_FILE_READ = (0x02, 0x04)
 CMD_LIST = (0x24, 0x02)
 CMD_LIST_PREP = (0x51, 0x02)
@@ -331,6 +334,12 @@ class DiscoveredDevice:
         return parts[0]
 
 
+@dataclass
+class FileReadResult:
+    data: bytes
+    ready_size: int
+
+
 def parse_discovery(data: bytes, addr: str) -> DiscoveredDevice:
     """Best-effort parse. Never rejects — firmware byte layouts vary by model.
 
@@ -477,11 +486,13 @@ class AimSession:
     """One TCP connection to the logger. Designed for short-lived per-task use."""
 
     def __init__(self, host: Optional[str] = None, port: int = TCP_PORT,
-                 timeout: float = 15.0, verbose: bool = False):
+                 timeout: float = 15.0, verbose: bool = False,
+                 bootstrap: bool = True):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.verbose = verbose
+        self.bootstrap = bootstrap
         self.sock: Optional[socket.socket] = None
         self.reader: Optional[FrameReader] = None
         self.device_info: bytes = b""
@@ -502,7 +513,7 @@ class AimSession:
                 verbose=self.verbose,
             )
             self._trace(f"auto-discovered host {self.host}")
-        plans = (
+        plans = ("none",) if not self.bootstrap else (
             "direct",
             "ping_then_init",
             "vendor_full",
@@ -539,10 +550,10 @@ class AimSession:
                                     f"{'...' if len(chunk) > 64 else ''}")
                 self.reader = FrameReader(self.sock, on_recv=on_recv)
                 self._hello()
-                # Some firmwares require a full session init (device-info + time-sync)
-                # before they accept application commands. Matches the vendor-app flow
-                # observed in download.pcapng.
-                self._bootstrap(plan)
+                if self.bootstrap:
+                    # Some firmwares require a full session init (device-info +
+                    # time-sync) before they accept application commands.
+                    self._bootstrap(plan)
                 return
             except (ProtocolError, ConnectionError, socket.timeout, OSError) as e:
                 last_exc = e
@@ -669,7 +680,7 @@ class AimSession:
         the observed capture ordering and wait for the initial 0xa01 RECEIVED
         ack of the init request before sending the 68B time-sync.
         """
-        size, status = self._run_handshake(
+        size, status = self._run_init_handshake(
             *CMD_DEVINFO,
             arg_tail=b"\x01",
             size=DEVINFO_REQ_SIZE,
@@ -683,7 +694,8 @@ class AimSession:
 
     def _sync_ping(self) -> None:
         """Lightweight state ping seen in vendor bootstrap before list activity."""
-        self._run_handshake(*CMD_SYNC_PING, size=HDR_SIZE)
+        self._send_stnc_cmd(*CMD_SYNC_PING, size=HDR_SIZE)
+        self._wait_ready(expected_cmd=CMD_SYNC_PING)
 
     def _bootstrap(self, plan: str) -> None:
         if plan == "direct":
@@ -704,8 +716,8 @@ class AimSession:
                        arg_tail: bytes = b"", size: int = 0) -> None:
         self._send(b"STNC", make_cmd(cmd, sub, path=path, arg_tail=arg_tail, size=size))
 
-    def _run_handshake(self, cmd: int, sub: int, *, arg_tail: bytes = b"",
-                       size: int = 0) -> tuple[int, int]:
+    def _run_init_handshake(self, cmd: int, sub: int, *, arg_tail: bytes = b"",
+                            size: int = 0) -> tuple[int, int]:
         expected = (cmd, sub)
         self._send_stnc_cmd(cmd, sub, arg_tail=arg_tail, size=size)
         size, status = self._wait_status(
@@ -783,13 +795,18 @@ class AimSession:
     def read_file(self, path: str, *,
                   progress: Optional[callable] = None) -> bytes:
         """cmd=0x02/0x04 file read. Works for both regular files and dev.ria."""
+        return self.read_file_result(path, progress=progress).data
+
+    def read_file_result(self, path: str, *,
+                         progress: Optional[callable] = None) -> FileReadResult:
+        """Read a file and keep the device's READY size for diagnostics."""
         self._send_stnc_cmd(*CMD_FILE_READ, path=path)
         size, status = self._wait_ready(expected_cmd=CMD_FILE_READ)
         if status == STATUS_EMPTY:
-            return b""
+            return FileReadResult(b"", size)
         if size == 0:
-            return b""
-        return self._read_stream(size, progress=progress)
+            return FileReadResult(b"", size)
+        return FileReadResult(self._read_stream(size, progress=progress), size)
 
     def fetch_list_csv(self) -> str:
         """Reproduce the vendor-app list flow: prep x2 → dev.ria probe → 0x24/02."""
@@ -808,12 +825,47 @@ class AimSession:
             return cached.decode("ascii", errors="replace")
 
         # 3) fresh fetch: cmd=0x24/02
+        return self.fetch_plain_list_csv()
+
+    def fetch_plain_list_csv(self) -> str:
+        """Fetch the current CSV directly via 0x24/02 with no prep/cache probe."""
         self._send_stnc_cmd(*CMD_LIST)
         size, status = self._wait_ready(expected_cmd=CMD_LIST)
         if status == STATUS_EMPTY or size == 0:
             return ""
         blob = self._read_stream(size)
         return blob.decode("ascii", errors="replace")
+
+    def delete_file(self, path: str) -> int:
+        """Delete one file via 0x06/0x04 and return the terminal status code."""
+        self._send_stnc_cmd(*CMD_FILE_DELETE, path=path)
+        expected_path = path.encode("ascii")
+        while True:
+            tag, pl = self._recv_frame()
+            if tag != b"STCP":
+                raise ProtocolError(f"unexpected non-STCP frame: tag={tag!r}")
+            if len(pl) < HDR_SIZE:
+                # Delete should not stream a body, but preserve the usual
+                # tolerance for short delimiter/ack frames.
+                continue
+            cmd, sub, size, status = parse_status(pl)
+            if (cmd, sub) != CMD_FILE_DELETE:
+                raise ProtocolError(
+                    f"unexpected status for cmd=0x{cmd:02x}/0x{sub:02x}; "
+                    f"want 0x{CMD_FILE_DELETE[0]:02x}/0x{CMD_FILE_DELETE[1]:02x}"
+                )
+            echoed = pl[ARG_OFFSET:].split(b"\x00", 1)[0]
+            if echoed != expected_path and not (status == STATUS_EMPTY and echoed == b""):
+                raise ProtocolError(
+                    f"delete path echo mismatch: got {echoed!r} want {expected_path!r}"
+                )
+            if status in (STATUS_RECEIVED, STATUS_PENDING):
+                continue
+            if status in (STATUS_READY, STATUS_EMPTY):
+                if size != 0:
+                    raise ProtocolError(f"unexpected delete completion size {size}")
+                return status
+            raise ProtocolError(f"unexpected delete status {status:#010x}")
 
     def fetch_device_info(self) -> bytes:
         """Return the device-info block captured during session init.
@@ -894,6 +946,45 @@ def parse_session_list(csv_text: str) -> list[Session]:
 # UI helpers
 # ---------------------------------------------------------------------------
 
+def _find_session_by_name(sessions: list[Session], name: str) -> Optional[Session]:
+    for s in sessions:
+        if s.name == name:
+            return s
+    return None
+
+
+def _session_sort_key(s: Session) -> Optional[tuple[int, int, int, int, int, int, str]]:
+    try:
+        day_s, month_s, year_s = s.date.split("/")
+        hour_parts = s.hour.split(":")
+        if len(hour_parts) not in (2, 3):
+            return None
+        hour_s, minute_s = hour_parts[:2]
+        second_s = hour_parts[2] if len(hour_parts) == 3 else "0"
+        return (
+            int(year_s),
+            int(month_s),
+            int(day_s),
+            int(hour_s),
+            int(minute_s),
+            int(second_s),
+            s.name,
+        )
+    except ValueError:
+        return None
+
+
+def _find_latest_session(sessions: list[Session]) -> Optional[Session]:
+    latest: Optional[tuple[tuple[int, int, int, int, int, int, str], Session]] = None
+    for s in sessions:
+        key = _session_sort_key(s)
+        if key is None:
+            continue
+        if latest is None or key > latest[0]:
+            latest = (key, s)
+    return None if latest is None else latest[1]
+
+
 def _fmt_size(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
@@ -934,6 +1025,41 @@ def render_session_table(sessions: list[Session]) -> str:
         if idx == 0:
             lines.append("  ".join("-" * w for w in widths))
     return "\n".join(lines)
+
+
+def _confirm(question: str, *, default: bool = False) -> bool:
+    # Prompts are only safe in an interactive terminal; in batch mode, fall
+    # back to the caller-provided default instead of blocking on stdin.
+    if not sys.stdin.isatty():
+        print(f"warn  {question} (stdin is not a TTY; treating as 'no')",
+              file=sys.stderr)
+        return default
+    suffix = " [Y/n] " if default else " [y/N] "
+    while True:
+        sys.stderr.write(question + suffix)
+        sys.stderr.flush()
+        answer = sys.stdin.readline()
+        if answer == "":
+            return default
+        answer = answer.strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("please answer yes or no", file=sys.stderr)
+
+
+def _validate_downloaded_session(name: str, data: bytes) -> None:
+    from aim_telemetry import build_session, decode_session_bytes, looks_like_zlib
+
+    # Reuse the telemetry parser as a structural integrity check rather than
+    # inventing a second "is this log valid?" implementation in aim.py.
+    raw = data
+    if name.lower().endswith(".xrz") or looks_like_zlib(data):
+        raw = decode_session_bytes(data, source=f"downloaded {name}", compressed=True)
+    build_session(raw)
 
 
 class _ProgressBar:
@@ -1057,6 +1183,7 @@ def cmd_download(args: argparse.Namespace) -> int:
             print("error: specify session name(s) or --all", file=sys.stderr)
             return 2
 
+        active_target = _find_latest_session(sessions)
         total_ok = 0
         for s in targets:
             try:
@@ -1064,41 +1191,86 @@ def cmd_download(args: argparse.Namespace) -> int:
             except ValueError as e:
                 print(f"fail  {s.name}: {e}", file=sys.stderr)
                 continue
+            previous_size = s.size
+            if active_target is not None and s.name == active_target.name:
+                try:
+                    # Only the latest session is expected to still be changing,
+                    # so avoid refetching the list for every older target.
+                    fresh = _find_session_by_name(parse_session_list(sess.fetch_list_csv()), s.name)
+                except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as e:
+                    print(f"fail  {s.name}: could not refresh list before download: {e}",
+                          file=sys.stderr)
+                    try:
+                        sess.reset()
+                    except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as reset_e:
+                        print(f"error: could not recover TCP session after failure: {reset_e}",
+                              file=sys.stderr)
+                        return 1
+                    continue
+                if fresh is None:
+                    print(f"fail  {s.name}: session no longer present in refreshed list",
+                          file=sys.stderr)
+                    continue
+                s = fresh
+            expected_size = s.size
+            size_changed = expected_size != previous_size
             dst = os.path.join(out_dir, local_name)
             if os.path.exists(dst) and not args.force:
                 st = os.stat(dst)
-                if st.st_size == s.size:
+                if st.st_size == expected_size:
                     print(f"skip  {s.name}  (already exists, size matches)")
                     total_ok += 1
                     continue
                 else:
                     print(f"warn  {s.name}  exists with different size "
-                          f"({st.st_size} vs {s.size}); use --force to overwrite",
+                          f"({st.st_size} vs {expected_size}); use --force to overwrite",
+                          file=sys.stderr)
+                    continue
+            if size_changed:
+                print(f"warn  {s.name}: list size changed {previous_size} -> {expected_size}; "
+                      "session appears to still be recording",
+                      file=sys.stderr)
+                if not _confirm(f"download {s.name} anyway?"):
+                    print(f"skip  {s.name}  (user declined download while session is changing)",
                           file=sys.stderr)
                     continue
 
-            progress = _ProgressBar(f"  {s.name}", s.size, enabled=not args.quiet)
+            progress = _ProgressBar(f"  {s.name}", expected_size, enabled=not args.quiet)
             try:
-                data = sess.read_file(s.remote_path, progress=progress)
+                read = sess.read_file_result(s.remote_path, progress=progress)
+                data = read.data
             except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as e:
                 print(f"fail  {s.name}: {e}", file=sys.stderr)
                 try:
                     sess.reset()
-                except (ProtocolError, ConnectionError, socket.timeout, OSError) as reset_e:
+                except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as reset_e:
                     print(f"error: could not recover TCP session after failure: {reset_e}",
                           file=sys.stderr)
                     return 1
                 continue
-            if len(data) != s.size:
-                print(f"fail  {s.name}: size mismatch (got {len(data)}, want {s.size})",
-                      file=sys.stderr)
+            if len(data) != expected_size:
                 try:
-                    sess.reset()
-                except (ProtocolError, ConnectionError, socket.timeout, OSError) as reset_e:
-                    print(f"error: could not recover TCP session after failure: {reset_e}",
+                    # If parsing still succeeds, the most likely explanation is
+                    # that the logger appended/finalized the file mid-download.
+                    _validate_downloaded_session(s.name, data)
+                except (ImportError, OSError, ValueError, struct.error) as parse_e:
+                    print(f"fail  {s.name}: size mismatch "
+                          f"(got {len(data)}, list {expected_size}, ready {read.ready_size}); "
+                          f"parse failed: {parse_e}",
                           file=sys.stderr)
-                    return 1
-                continue
+                    continue
+                print(f"warn  {s.name}: size mismatch "
+                      f"(got {len(data)}, list {expected_size}, ready {read.ready_size}); "
+                      "logger file changed during download",
+                      file=sys.stderr)
+                if not _confirm(f"save {s.name} anyway?"):
+                    print(f"skip  {s.name}  (user declined saving log captured while session changed)",
+                          file=sys.stderr)
+                    continue
+            if args.verbose:
+                print(f"  [aim] download result {s.name}: "
+                      f"got={len(data)} list={expected_size} ready={read.ready_size}",
+                      file=sys.stderr)
             tmp = dst + ".part"
             with open(tmp, "wb") as f:
                 f.write(data)
@@ -1107,6 +1279,72 @@ def cmd_download(args: argparse.Namespace) -> int:
             total_ok += 1
 
         return 0 if total_ok == len(targets) else 1
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    with AimSession(host=args.host, timeout=args.timeout, verbose=args.verbose) as sess:
+        csv_text = sess.fetch_list_csv()
+        sessions = parse_session_list(csv_text)
+        host = sess.host
+
+    if not sessions:
+        print("no sessions on device", file=sys.stderr)
+        return 1
+
+    targets = _resolve_targets(sessions, args.names, args.all)
+    if not targets:
+        print("error: specify session name(s) or --all", file=sys.stderr)
+        return 2
+
+    if not args.yes:
+        if len(targets) == 1:
+            prompt = f"delete {targets[0].name} from device?"
+        else:
+            prompt = f"delete {len(targets)} sessions from device?"
+        if not _confirm(prompt):
+            print("cancelled", file=sys.stderr)
+            return 0
+
+    deleted_names: list[str] = []
+    total_ok = 0
+    with AimSession(host=host, timeout=args.timeout, verbose=args.verbose,
+                    bootstrap=False) as sess:
+        for s in targets:
+            try:
+                status = sess.delete_file(s.remote_path)
+            except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as e:
+                print(f"fail  {s.name}: {e}", file=sys.stderr)
+                try:
+                    sess.reset()
+                except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as reset_e:
+                    print(f"error: could not recover TCP session after failure: {reset_e}",
+                          file=sys.stderr)
+                    return 1
+                continue
+            if status == STATUS_EMPTY:
+                print(f"fail  {s.name}: device reported file missing", file=sys.stderr)
+                continue
+            if args.verbose:
+                print(f"  [aim] delete result {s.name}: status={status:#010x}",
+                      file=sys.stderr)
+            print(f"ok    {s.name}  deleted")
+            deleted_names.append(s.name)
+            total_ok += 1
+
+        if deleted_names:
+            try:
+                remaining = parse_session_list(sess.fetch_plain_list_csv())
+            except (ProtocolError, ConnectionError, socket.timeout, OSError, ValueError) as e:
+                print(f"error: could not verify deleted sessions: {e}", file=sys.stderr)
+                return 1
+            remaining_names = {item.name for item in remaining}
+            for name in deleted_names:
+                if name in remaining_names:
+                    print(f"fail  {name}: still present after delete verification",
+                          file=sys.stderr)
+                    total_ok -= 1
+
+    return 0 if total_ok == len(targets) else 1
 
 
 def cmd_info(args: argparse.Namespace) -> int:
@@ -1165,7 +1403,7 @@ def cmd_info(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="aim",
-        description="Download driving records from an AiM data logger over Wi-Fi.",
+        description="List, download, and delete driving records from an AiM data logger over Wi-Fi.",
     )
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1204,6 +1442,19 @@ def build_parser() -> argparse.ArgumentParser:
     dl.add_argument("names", nargs="*",
                     help="Session names (a_7064.xrz), short names (a_7064), or 1-based indices.")
     dl.set_defaults(func=cmd_download)
+
+    rm = sub.add_parser("delete", help="Delete session file(s) from the device.")
+    rm.add_argument("--host", default=None,
+                    help="Logger IP. If omitted, auto-discover among known AP IPs.")
+    rm.add_argument("--timeout", type=float, default=30.0)
+    rm.add_argument("--all", action="store_true", help="Delete every session.")
+    rm.add_argument("-y", "--yes", action="store_true",
+                    help="Delete without confirmation.")
+    rm.add_argument("-v", "--verbose", action="store_true",
+                    help="Trace every TCP frame (tx/rx) with decoded cmd/status.")
+    rm.add_argument("names", nargs="*",
+                    help="Session names (a_7064.xrz), short names (a_7064), or 1-based indices.")
+    rm.set_defaults(func=cmd_delete)
 
     info = sub.add_parser("info", help="Dump device info block.")
     info.add_argument("--host", default=None,

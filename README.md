@@ -8,7 +8,7 @@ Reverse-engineered from network captures of an AiM SOLO2DL. No vendor SDK requir
 
 | Script | Purpose |
 |---|---|
-| `aim.py` | Download sessions from the logger over Wi-Fi |
+| `aim.py` | List, download, and delete sessions from the logger over Wi-Fi |
 | `xrk2csv.py` | Convert `.xrk` / `.xrz` session files to CSV |
 | `xrz2xrk.py` | Convert `.xrz` (compressed) to `.xrk` (export format) |
 
@@ -78,6 +78,30 @@ Options:
 
 Files are written atomically via a `.part` temp file. Existing files whose size already matches are skipped automatically.
 
+### delete
+
+Delete one or more sessions by name, short name, or index:
+
+```
+python aim.py delete a_7064.xrz
+python aim.py delete a_7064
+python aim.py delete 1
+python aim.py delete --all
+python aim.py delete a_7064.xrz a_7065.xrz -y
+```
+
+Options:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host IP` | auto | Logger IP address |
+| `--all` | off | Delete every session |
+| `-y`, `--yes` | off | Skip the confirmation prompt |
+| `--timeout SEC` | 30 | TCP timeout in seconds |
+| `-v` | off | Trace every TCP frame |
+
+`delete` first resolves the targets from the current session list, then opens a fresh delete-only TCP session (`hello -> delete -> list verify`) to match the protocol captured from the vendor app.
+
 ### info
 
 Dump the device info block (firmware, Wi-Fi config, system flags):
@@ -93,7 +117,7 @@ python aim.py info --host 10.0.0.1
 
 ## xrk2csv.py — Telemetry to CSV
 
-Convert a downloaded `.xrz` or `.xrk` file into a flat CSV with ~65 columns.
+Convert a downloaded `.xrz` or `.xrk` file into a flat CSV with ~68 columns.
 
 ```
 python xrk2csv.py session.xrz
@@ -105,7 +129,7 @@ The output CSV contains one row per master clock tick (10 Hz base rate) with col
 
 | Column group | Channels |
 |---|---|
-| Time | `Time` (seconds from session start) |
+| Time | `Time` (seconds from session start, anchored to `LAP` when present) |
 | GPS | Speed, Lat/Lon, Altitude, Heading, Slope, LatAcc, LonAcc, Gyro, Radius, PosAccuracy, SpdAccuracy, Nsat |
 | IMU | InlineAcc, LateralAcc, VerticalAcc, RollRate, PitchRate, YawRate, MagnetomX/Y/Z |
 | Drivetrain | RPM, Gear, Speed, Wheel speeds (FL/FR/RL/RR) |
@@ -115,6 +139,11 @@ The output CSV contains one row per master clock tick (10 Hz base rate) with col
 | Electrical | Internal Battery, External Voltage, Battery Volt, Current IBS |
 | Status | ABS, ASC, DSC, Brake, Eng Mode, Clutch Sw, Fuel Lamp, Hi Beam, Indicator lights, Eng Heat St |
 | Distance | Distance on GPS Speed, Distance on Vehicle Speed |
+
+The parser keeps CHS metadata (units, calibrated flag, interpolation hints,
+display ranges, source ids), repairs the known GPS `~65533 ms` tick jump when
+it appears, and decodes newer expansion-device `(c)` channels used by shock
+potentiometers and IMUs on newer AiM loggers.
 
 ---
 
@@ -130,6 +159,9 @@ python xrz2xrk.py session.xrz --force    # overwrite existing output
 ```
 
 The XRK footer appended by this tool is functionally identical to what the AiM Race Studio export produces: `raw_body + RCR + VEH + VTY + NTE frames (120 B)`.
+
+Both `xrk2csv.py` and `xrz2xrk.py` accept truncated `.xrz` inputs as long as
+zlib can still recover a structurally valid partial session.
 
 ---
 
@@ -147,10 +179,13 @@ python aim.py list
 # 4. Download all sessions
 python aim.py download --all -o ./sessions
 
-# 5. Convert to CSV
+# 5. (Optional) Delete old sessions from the logger
+python aim.py delete a_7064.xrz
+
+# 6. Convert to CSV
 python xrk2csv.py sessions/a_7064.xrz
 
-# 6. (Optional) Export to XRK format
+# 7. (Optional) Export to XRK format
 python xrz2xrk.py sessions/a_7064.xrz --racer "Driver" --vehicle "SOLO2DL"
 ```
 
