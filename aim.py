@@ -19,6 +19,7 @@ import argparse
 import csv
 import io
 import os
+import re
 import socket
 import struct
 import sys
@@ -72,6 +73,34 @@ DEVINFO_REQ_SIZE = HDR_SIZE
 
 RECORDED_DIR = "1:/mem"
 LIST_CACHE_PATH = "0:/tkk/dev.ria"
+SESSION_LIST_COLUMNS = [
+    "name",
+    "size",
+    "date",
+    "hour",
+    "nlap",
+    "nbest",
+    "best",
+    "pilota",
+    "track_name",
+    "veicolo",
+    "campionato",
+    "venue_type",
+    "mode",
+    "trk_type",
+    "motivolap",
+    "maxvel",
+    "device",
+    "track_lat",
+    "track_lon",
+    "test_dur",
+    "pname",
+    "ptype",
+    "ptime",
+    "pdist",
+    "pmaxv",
+]
+SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 # ---------------------------------------------------------------------------
@@ -822,7 +851,13 @@ class AimSession:
         # 2) cache probe: dev.ria. If cached, CSV comes back here.
         cached = self.read_file(LIST_CACHE_PATH)
         if cached:
-            return cached.decode("ascii", errors="replace")
+            cached_text = cached.decode("utf-8-sig", errors="replace")
+            if _looks_like_session_list(parse_session_list(cached_text)):
+                return cached_text
+            self._trace(
+                "dev.ria cache did not look like a session list; "
+                "falling back to 0x24/0x02"
+            )
 
         # 3) fresh fetch: cmd=0x24/02
         return self.fetch_plain_list_csv()
@@ -909,20 +944,29 @@ def parse_session_list(csv_text: str) -> list[Session]:
     """Parse the CSV returned by fetch_list_csv()."""
     if not csv_text.strip():
         return []
-    reader = csv.reader(io.StringIO(csv_text))
+    if csv_text.startswith("\ufeff"):
+        csv_text = csv_text.lstrip("\ufeff")
+    delimiter = _detect_csv_delimiter(csv_text)
+    reader = csv.reader(io.StringIO(csv_text), delimiter=delimiter)
     try:
         header = next(reader)
     except StopIteration:
         return []
-    header = [h.strip() for h in header]
+    header = [h.strip().lstrip("\ufeff") for h in header]
+    has_header = len(header) >= 2 and header[0].lower() == "name" and header[1].lower() == "size"
+    if has_header:
+        columns = header
+    else:
+        columns = SESSION_LIST_COLUMNS[:len(header)]
+        reader = csv.reader(io.StringIO(csv_text), delimiter=delimiter)
     out: list[Session] = []
     for row in reader:
         if not row or not row[0]:
             continue
         # pad row to header length
-        if len(row) < len(header):
-            row = row + [""] * (len(header) - len(row))
-        d = dict(zip(header, row))
+        if len(row) < len(columns):
+            row = row + [""] * (len(columns) - len(row))
+        d = dict(zip(columns, row))
         try:
             size = int(d.get("size", "0") or "0")
         except ValueError:
@@ -940,6 +984,42 @@ def parse_session_list(csv_text: str) -> list[Session]:
             raw=d,
         ))
     return out
+
+
+def _detect_csv_delimiter(csv_text: str) -> str:
+    """Pick the delimiter used by the device's list output."""
+    sample_lines = [line for line in csv_text.splitlines() if line.strip()][:5]
+    sample = "\n".join(sample_lines)
+    if not sample:
+        return ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        return dialect.delimiter
+    except csv.Error:
+        pass
+    counts = {
+        delim: sum(line.count(delim) for line in sample_lines)
+        for delim in (",", ";", "\t", "|")
+    }
+    best_delim, best_count = max(counts.items(), key=lambda item: item[1])
+    return best_delim if best_count > 0 else ","
+
+
+def _looks_like_session_list(sessions: list[Session]) -> bool:
+    """Reject cache blobs or garbage that happen to parse as rows."""
+    if not sessions:
+        return False
+    for s in sessions:
+        if s.size <= 0:
+            continue
+        if not s.name:
+            continue
+        if "/" in s.name or "\\" in s.name or ";" in s.name or "," in s.name:
+            continue
+        if not SESSION_NAME_RE.fullmatch(s.name):
+            continue
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1415,7 +1495,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Print every received UDP datagram.")
     d.set_defaults(func=cmd_discover)
 
-    ls = sub.add_parser("list", help="List recorded sessions.")
+    ls = sub.add_parser("list", aliases=["sessions"], help="List recorded sessions.")
     ls.add_argument("--host", default=None,
                     help="Logger IP. If omitted, auto-discover among known AP IPs.")
     ls.add_argument("--timeout", type=float, default=15.0)
