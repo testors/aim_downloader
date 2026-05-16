@@ -10,6 +10,7 @@ from aim_telemetry import (
     decode_session_bytes,
     repair_gps_timecodes,
 )
+from aim import parse_session_list
 
 
 def wrap_frame(tag: str, payload: bytes, cls: int = 0x00) -> bytes:
@@ -167,6 +168,33 @@ class AimTelemetryTests(unittest.TestCase):
             session.channel_samples[100],
             [(1000, 20.0), (1002, 10.0), (1004, 40.0), (1006, 50.0), (1008, 30.0)],
         )
+
+    def test_parse_session_list_accepts_documented_header(self) -> None:
+        csv_text = (
+            "name,size,date,hour,nlap,nbest,best,pilota,track_name\n"
+            "a_7064.xrz,123,21/04/2026,18:24,23,1,117612,Driver,Inje NCK\n"
+        )
+        sessions = parse_session_list(csv_text)
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].name, "a_7064.xrz")
+        self.assertEqual(sessions[0].track_name, "Inje NCK")
+
+    def test_parse_session_list_accepts_headerless_rows(self) -> None:
+        csv_text = "a_7064.xrz,123,21/04/2026,18:24,23,1,117612,Driver,Inje NCK\n"
+        sessions = parse_session_list(csv_text)
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].name, "a_7064.xrz")
+        self.assertEqual(sessions[0].size, 123)
+
+    def test_parse_session_list_accepts_semicolon_delimited_rows(self) -> None:
+        csv_text = (
+            "name;size;date;hour;nlap;nbest;best;pilota;track_name\n"
+            "a_7064.xrz;123;21/04/2026;18:24;23;1;117612;Driver;Inje NCK\n"
+        )
+        sessions = parse_session_list(csv_text)
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].name, "a_7064.xrz")
+        self.assertEqual(sessions[0].track_name, "Inje NCK")
 
 
 if __name__ == "__main__":
